@@ -25,6 +25,10 @@
 (define-constant err-unauthorized-usage (err u106))
 (define-constant err-invalid-price (err u107))
 (define-constant err-payment-failed (err u108))
+(define-constant err-subscription-not-found (err u109))
+(define-constant err-subscription-expired (err u110))
+(define-constant err-subscription-already-exists (err u111))
+(define-constant err-invalid-subscription-period (err u112))
 
 (define-constant license-commercial u1)
 (define-constant license-personal u2)
@@ -34,6 +38,7 @@
 ;; data vars
 (define-data-var next-license-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
+(define-data-var next-subscription-id uint u1)
 
 ;; data maps
 (define-map licenses
@@ -80,6 +85,40 @@
 )
 
 (define-map user-usage-counter principal uint)
+
+(define-map license-subscriptions
+  uint
+  {
+    license-id: uint,
+    creator: principal,
+    subscription-price: uint,
+    period-blocks: uint,
+    max-subscribers: uint,
+    current-subscribers: uint,
+    is-active: bool,
+    created-at: uint
+  }
+)
+
+(define-map active-subscriptions
+  {subscription-id: uint, subscriber: principal}
+  {
+    started-at: uint,
+    expires-at: uint,
+    auto-renewal: bool,
+    total-periods-paid: uint
+  }
+)
+
+(define-map subscription-payments
+  {subscription-id: uint, subscriber: principal, payment-period: uint}
+  {
+    paid-at: uint,
+    amount-paid: uint,
+    period-start: uint,
+    period-end: uint
+  }
+)
 
 ;; public functions
 (define-public (create-license 
@@ -234,6 +273,171 @@
   )
 )
 
+(define-public (create-subscription
+  (license-id uint)
+  (subscription-price uint)
+  (period-blocks uint)
+  (max-subscribers uint))
+  (let
+    (
+      (license-data (unwrap! (map-get? licenses license-id) err-token-not-found))
+      (license-owner (unwrap! (nft-get-owner? art-license license-id) err-token-not-found))
+      (subscription-id (var-get next-subscription-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender license-owner) err-not-token-owner)
+    (asserts! (> subscription-price u0) err-invalid-price)
+    (asserts! (> period-blocks u1000) err-invalid-subscription-period)
+    (asserts! (> max-subscribers u0) err-invalid-subscription-period)
+    
+    (map-set license-subscriptions subscription-id
+      {
+        license-id: license-id,
+        creator: tx-sender,
+        subscription-price: subscription-price,
+        period-blocks: period-blocks,
+        max-subscribers: max-subscribers,
+        current-subscribers: u0,
+        is-active: true,
+        created-at: current-block
+      }
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (subscribe-to-license
+  (subscription-id uint)
+  (auto-renewal bool))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? license-subscriptions subscription-id) err-subscription-not-found))
+      (current-block stacks-block-height)
+      (subscription-key {subscription-id: subscription-id, subscriber: tx-sender})
+      (existing-subscription (map-get? active-subscriptions subscription-key))
+      (price (get subscription-price subscription-data))
+      (creator (get creator subscription-data))
+      (platform-fee (/ (* price (var-get platform-fee-percentage)) u10000))
+      (creator-payment (- price platform-fee))
+      (expires-at (+ current-block (get period-blocks subscription-data)))
+    )
+    (asserts! (get is-active subscription-data) err-subscription-not-found)
+    (asserts! (< (get current-subscribers subscription-data) (get max-subscribers subscription-data)) err-subscription-already-exists)
+    (asserts! (is-none existing-subscription) err-subscription-already-exists)
+    (asserts! (not (is-eq tx-sender creator)) err-owner-only)
+    
+    (try! (stx-transfer? creator-payment tx-sender creator))
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    
+    (map-set active-subscriptions subscription-key
+      {
+        started-at: current-block,
+        expires-at: expires-at,
+        auto-renewal: auto-renewal,
+        total-periods-paid: u1
+      }
+    )
+    
+    (map-set subscription-payments
+      {subscription-id: subscription-id, subscriber: tx-sender, payment-period: u1}
+      {
+        paid-at: current-block,
+        amount-paid: price,
+        period-start: current-block,
+        period-end: expires-at
+      }
+    )
+    
+    (map-set license-subscriptions subscription-id
+      (merge subscription-data {current-subscribers: (+ (get current-subscribers subscription-data) u1)})
+    )
+    
+    (update-creator-stats creator false creator-payment)
+    (ok true)
+  )
+)
+
+(define-public (renew-subscription (subscription-id uint))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? license-subscriptions subscription-id) err-subscription-not-found))
+      (subscription-key {subscription-id: subscription-id, subscriber: tx-sender})
+      (active-sub (unwrap! (map-get? active-subscriptions subscription-key) err-subscription-not-found))
+      (current-block stacks-block-height)
+      (price (get subscription-price subscription-data))
+      (creator (get creator subscription-data))
+      (platform-fee (/ (* price (var-get platform-fee-percentage)) u10000))
+      (creator-payment (- price platform-fee))
+      (new-expires-at (+ (get expires-at active-sub) (get period-blocks subscription-data)))
+      (next-period (+ (get total-periods-paid active-sub) u1))
+    )
+    (asserts! (get is-active subscription-data) err-subscription-not-found)
+    (asserts! (< current-block (get expires-at active-sub)) err-subscription-expired)
+    
+    (try! (stx-transfer? creator-payment tx-sender creator))
+    (try! (stx-transfer? platform-fee tx-sender contract-owner))
+    
+    (map-set active-subscriptions subscription-key
+      (merge active-sub 
+        {
+          expires-at: new-expires-at,
+          total-periods-paid: next-period
+        }
+      )
+    )
+    
+    (map-set subscription-payments
+      {subscription-id: subscription-id, subscriber: tx-sender, payment-period: next-period}
+      {
+        paid-at: current-block,
+        amount-paid: price,
+        period-start: (get expires-at active-sub),
+        period-end: new-expires-at
+      }
+    )
+    
+    (update-creator-stats creator false creator-payment)
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? license-subscriptions subscription-id) err-subscription-not-found))
+      (subscription-key {subscription-id: subscription-id, subscriber: tx-sender})
+      (active-sub (unwrap! (map-get? active-subscriptions subscription-key) err-subscription-not-found))
+    )
+    (map-delete active-subscriptions subscription-key)
+    
+    (map-set license-subscriptions subscription-id
+      (merge subscription-data 
+        {current-subscribers: (if (> (get current-subscribers subscription-data) u0)
+                                (- (get current-subscribers subscription-data) u1)
+                                u0)
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (deactivate-subscription (subscription-id uint))
+  (let
+    (
+      (subscription-data (unwrap! (map-get? license-subscriptions subscription-id) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator subscription-data)) err-not-token-owner)
+    
+    (map-set license-subscriptions subscription-id
+      (merge subscription-data {is-active: false})
+    )
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-license (license-id uint))
   (map-get? licenses license-id)
@@ -287,6 +491,29 @@
       )
     )
   )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? license-subscriptions subscription-id)
+)
+
+(define-read-only (get-active-subscription (subscription-id uint) (subscriber principal))
+  (map-get? active-subscriptions {subscription-id: subscription-id, subscriber: subscriber})
+)
+
+(define-read-only (is-subscription-active (subscription-id uint) (subscriber principal))
+  (match (map-get? active-subscriptions {subscription-id: subscription-id, subscriber: subscriber})
+    subscription-data (< stacks-block-height (get expires-at subscription-data))
+    false
+  )
+)
+
+(define-read-only (get-subscription-payment (subscription-id uint) (subscriber principal) (payment-period uint))
+  (map-get? subscription-payments {subscription-id: subscription-id, subscriber: subscriber, payment-period: payment-period})
+)
+
+(define-read-only (get-next-subscription-id)
+  (var-get next-subscription-id)
 )
 
 ;; private functions
