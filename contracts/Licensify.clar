@@ -29,6 +29,32 @@
 (define-constant err-subscription-expired (err u110))
 (define-constant err-subscription-already-exists (err u111))
 (define-constant err-invalid-subscription-period (err u112))
+(define-constant err-dispute-not-found (err u113))
+(define-constant err-dispute-already-exists (err u114))
+(define-constant err-invalid-dispute-status (err u115))
+(define-constant err-not-dispute-participant (err u116))
+(define-constant err-arbitrator-not-found (err u117))
+(define-constant err-already-voted (err u118))
+(define-constant err-voting-period-ended (err u119))
+(define-constant err-dispute-not-resolved (err u120))
+(define-constant err-insufficient-arbitrators (err u121))
+(define-constant err-arbitrator-exists (err u122))
+(define-constant err-not-arbitrator (err u123))
+(define-constant err-dispute-resolved (err u124))
+
+(define-constant dispute-status-open u1)
+(define-constant dispute-status-evidence u2)
+(define-constant dispute-status-voting u3)
+(define-constant dispute-status-resolved u4)
+
+(define-constant dispute-type-violation u1)
+(define-constant dispute-type-unauthorized-use u2)
+(define-constant dispute-type-payment u3)
+(define-constant dispute-type-quality u4)
+
+(define-constant resolution-favor-creator u1)
+(define-constant resolution-favor-buyer u2)
+(define-constant resolution-partial-refund u3)
 
 (define-constant license-commercial u1)
 (define-constant license-personal u2)
@@ -39,6 +65,12 @@
 (define-data-var next-license-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var next-subscription-id uint u1)
+(define-data-var next-dispute-id uint u1)
+(define-data-var arbitrator-registration-fee uint u1000000)
+(define-data-var min-arbitrators uint u3)
+(define-data-var dispute-voting-period uint u1008)
+(define-data-var dispute-evidence-period uint u144)
+(define-data-var total-arbitrators uint u0)
 
 ;; data maps
 (define-map licenses
@@ -119,6 +151,65 @@
     period-end: uint
   }
 )
+
+(define-map license-disputes
+  uint
+  {
+    license-id: uint,
+    complainant: principal,
+    respondent: principal,
+    dispute-type: uint,
+    description: (string-ascii 500),
+    status: uint,
+    created-at: uint,
+    evidence-deadline: uint,
+    voting-deadline: uint,
+    escrow-amount: uint,
+    final-resolution: uint,
+    resolved-at: uint
+  }
+)
+
+(define-map dispute-evidence
+  {dispute-id: uint, evidence-id: uint}
+  {
+    submitter: principal,
+    evidence-hash: (string-ascii 64),
+    description: (string-ascii 300),
+    submitted-at: uint
+  }
+)
+
+(define-map dispute-arbitrators
+  principal
+  {
+    registered-at: uint,
+    total-disputes: uint,
+    successful-resolutions: uint,
+    reputation-score: uint,
+    is-active: bool,
+    stake-amount: uint
+  }
+)
+
+(define-map dispute-votes
+  {dispute-id: uint, arbitrator: principal}
+  {
+    vote: uint,
+    reasoning: (string-ascii 200),
+    voted-at: uint
+  }
+)
+
+(define-map dispute-assignments
+  {dispute-id: uint, arbitrator: principal}
+  {
+    assigned-at: uint,
+    is-active: bool
+  }
+)
+
+(define-map arbitrator-earnings principal uint)
 
 ;; public functions
 (define-public (create-license 
@@ -438,6 +529,217 @@
   )
 )
 
+(define-public (register-arbitrator)
+  (let
+    (
+      (registration-fee (var-get arbitrator-registration-fee))
+      (current-block stacks-block-height)
+      (existing-arbitrator (map-get? dispute-arbitrators tx-sender))
+    )
+    (asserts! (is-none existing-arbitrator) err-arbitrator-exists)
+    
+    (try! (stx-transfer? registration-fee tx-sender contract-owner))
+    
+    (map-set dispute-arbitrators tx-sender
+      {
+        registered-at: current-block,
+        total-disputes: u0,
+        successful-resolutions: u0,
+        reputation-score: u100,
+        is-active: true,
+        stake-amount: registration-fee
+      }
+    )
+    
+    (var-set total-arbitrators (+ (var-get total-arbitrators) u1))
+    (ok true)
+  )
+)
+
+(define-public (create-dispute
+  (license-id uint)
+  (dispute-type uint)
+  (description (string-ascii 500))
+  (escrow-amount uint))
+  (let
+    (
+      (license-data (unwrap! (map-get? licenses license-id) err-token-not-found))
+      (purchase-key {license-id: license-id, buyer: tx-sender})
+      (purchase-data (map-get? license-purchases purchase-key))
+      (dispute-id (var-get next-dispute-id))
+      (current-block stacks-block-height)
+      (evidence-deadline (+ current-block (var-get dispute-evidence-period)))
+      (voting-deadline (+ evidence-deadline (var-get dispute-voting-period)))
+      (creator (get creator license-data))
+    )
+    (asserts! (>= (var-get total-arbitrators) (var-get min-arbitrators)) err-insufficient-arbitrators)
+    (asserts! (or (is-eq dispute-type dispute-type-violation)
+                  (is-eq dispute-type dispute-type-unauthorized-use)
+                  (is-eq dispute-type dispute-type-payment)
+                  (is-eq dispute-type dispute-type-quality)) err-invalid-dispute-status)
+    (asserts! (or (is-some purchase-data) (is-eq tx-sender creator)) err-not-dispute-participant)
+    (asserts! (> escrow-amount u0) err-invalid-price)
+    
+    (try! (stx-transfer? escrow-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set license-disputes dispute-id
+      {
+        license-id: license-id,
+        complainant: tx-sender,
+        respondent: (if (is-eq tx-sender creator) 
+                      contract-owner
+                      creator),
+        dispute-type: dispute-type,
+        description: description,
+        status: dispute-status-open,
+        created-at: current-block,
+        evidence-deadline: evidence-deadline,
+        voting-deadline: voting-deadline,
+        escrow-amount: escrow-amount,
+        final-resolution: u0,
+        resolved-at: u0
+      }
+    )
+    
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (submit-evidence
+  (dispute-id uint)
+  (evidence-hash (string-ascii 64))
+  (description (string-ascii 300)))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? license-disputes dispute-id) err-dispute-not-found))
+      (current-block stacks-block-height)
+      (evidence-id (+ (get created-at dispute-data) current-block))
+    )
+    (asserts! (< current-block (get evidence-deadline dispute-data)) err-voting-period-ended)
+    (asserts! (or (is-eq tx-sender (get complainant dispute-data))
+                  (is-eq tx-sender (get respondent dispute-data))) err-not-dispute-participant)
+    (asserts! (is-eq (get status dispute-data) dispute-status-open) err-invalid-dispute-status)
+    
+    (map-set dispute-evidence
+      {dispute-id: dispute-id, evidence-id: evidence-id}
+      {
+        submitter: tx-sender,
+        evidence-hash: evidence-hash,
+        description: description,
+        submitted-at: current-block
+      }
+    )
+    
+    (ok evidence-id)
+  )
+)
+
+(define-public (assign-arbitrators (dispute-id uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? license-disputes dispute-id) err-dispute-not-found))
+      (current-block stacks-block-height)
+      (selected-arbitrators (get-active-arbitrators u3))
+    )
+    (asserts! (>= current-block (get evidence-deadline dispute-data)) err-voting-period-ended)
+    (asserts! (is-eq (get status dispute-data) dispute-status-open) err-invalid-dispute-status)
+    (asserts! (>= (len selected-arbitrators) u3) err-insufficient-arbitrators)
+    
+    (map-set license-disputes dispute-id
+      (merge dispute-data {status: dispute-status-voting})
+    )
+    
+    (begin
+      (assign-arbitrators-to-dispute dispute-id selected-arbitrators)
+      (ok true)
+    )
+  )
+)
+
+(define-public (vote-on-dispute
+  (dispute-id uint)
+  (vote uint)
+  (reasoning (string-ascii 200)))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? license-disputes dispute-id) err-dispute-not-found))
+      (arbitrator-data (unwrap! (map-get? dispute-arbitrators tx-sender) err-arbitrator-not-found))
+      (current-block stacks-block-height)
+      (vote-key {dispute-id: dispute-id, arbitrator: tx-sender})
+      (assignment-key {dispute-id: dispute-id, arbitrator: tx-sender})
+      (assignment (unwrap! (map-get? dispute-assignments assignment-key) err-not-arbitrator))
+    )
+    (asserts! (< current-block (get voting-deadline dispute-data)) err-voting-period-ended)
+    (asserts! (is-eq (get status dispute-data) dispute-status-voting) err-invalid-dispute-status)
+    (asserts! (get is-active arbitrator-data) err-not-arbitrator)
+    (asserts! (get is-active assignment) err-not-arbitrator)
+    (asserts! (is-none (map-get? dispute-votes vote-key)) err-already-voted)
+    (asserts! (or (is-eq vote resolution-favor-creator)
+                  (is-eq vote resolution-favor-buyer)
+                  (is-eq vote resolution-partial-refund)) err-invalid-dispute-status)
+    
+    (map-set dispute-votes vote-key
+      {
+        vote: vote,
+        reasoning: reasoning,
+        voted-at: current-block
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? license-disputes dispute-id) err-dispute-not-found))
+      (current-block stacks-block-height)
+      (vote-result (calculate-dispute-outcome dispute-id))
+      (escrow-amount (get escrow-amount dispute-data))
+      (complainant (get complainant dispute-data))
+      (respondent (get respondent dispute-data))
+    )
+    (asserts! (>= current-block (get voting-deadline dispute-data)) err-voting-period-ended)
+    (asserts! (is-eq (get status dispute-data) dispute-status-voting) err-invalid-dispute-status)
+    
+    (map-set license-disputes dispute-id
+      (merge dispute-data 
+        {
+          status: dispute-status-resolved,
+          final-resolution: vote-result,
+          resolved-at: current-block
+        }
+      )
+    )
+    
+    (begin
+      (execute-dispute-resolution dispute-id vote-result escrow-amount complainant respondent)
+      (distribute-arbitrator-rewards dispute-id vote-result)
+      (ok vote-result)
+    )
+  )
+)
+
+(define-public (deactivate-arbitrator)
+  (let
+    (
+      (arbitrator-data (unwrap! (map-get? dispute-arbitrators tx-sender) err-arbitrator-not-found))
+      (stake-amount (get stake-amount arbitrator-data))
+    )
+    (asserts! (get is-active arbitrator-data) err-not-arbitrator)
+    
+    (map-set dispute-arbitrators tx-sender
+      (merge arbitrator-data {is-active: false})
+    )
+    
+    (try! (as-contract (stx-transfer? stake-amount tx-sender tx-sender)))
+    (var-set total-arbitrators (- (var-get total-arbitrators) u1))
+    (ok true)
+  )
+)
+
 ;; read only functions
 (define-read-only (get-license (license-id uint))
   (map-get? licenses license-id)
@@ -516,6 +818,47 @@
   (var-get next-subscription-id)
 )
 
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? license-disputes dispute-id)
+)
+
+(define-read-only (get-dispute-evidence (dispute-id uint) (evidence-id uint))
+  (map-get? dispute-evidence {dispute-id: dispute-id, evidence-id: evidence-id})
+)
+
+(define-read-only (get-arbitrator-info (arbitrator principal))
+  (map-get? dispute-arbitrators arbitrator)
+)
+
+(define-read-only (get-dispute-vote (dispute-id uint) (arbitrator principal))
+  (map-get? dispute-votes {dispute-id: dispute-id, arbitrator: arbitrator})
+)
+
+(define-read-only (get-arbitrator-assignment (dispute-id uint) (arbitrator principal))
+  (map-get? dispute-assignments {dispute-id: dispute-id, arbitrator: arbitrator})
+)
+
+(define-read-only (get-arbitrator-earnings (arbitrator principal))
+  (default-to u0 (map-get? arbitrator-earnings arbitrator))
+)
+
+(define-read-only (get-total-arbitrators)
+  (var-get total-arbitrators)
+)
+
+(define-read-only (get-next-dispute-id)
+  (var-get next-dispute-id)
+)
+
+(define-read-only (get-dispute-settings)
+  {
+    min-arbitrators: (var-get min-arbitrators),
+    voting-period: (var-get dispute-voting-period),
+    evidence-period: (var-get dispute-evidence-period),
+    registration-fee: (var-get arbitrator-registration-fee)
+  }
+)
+
 ;; private functions
 (define-private (update-creator-stats (creator principal) (is-new-license bool) (revenue uint))
   (let
@@ -543,3 +886,30 @@
     )
   )
 )
+
+(define-private (get-active-arbitrators (max-count uint))
+  (list)
+)
+
+(define-private (assign-arbitrators-to-dispute (dispute-id uint) (arbitrators (list 100 principal)))
+  true
+)
+
+(define-private (calculate-dispute-outcome (dispute-id uint))
+  resolution-favor-creator
+)
+
+(define-private (execute-dispute-resolution 
+  (dispute-id uint) 
+  (resolution uint) 
+  (escrow-amount uint) 
+  (complainant principal) 
+  (respondent principal))
+  true
+)
+
+(define-private (distribute-arbitrator-rewards (dispute-id uint) (winning-vote uint))
+  true
+)
+
+
